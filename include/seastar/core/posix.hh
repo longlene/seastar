@@ -97,6 +97,8 @@ public:
     }
     int get() const { return _fd; }
 
+    sstring fdinfo() const noexcept;
+
     static file_desc from_fd(int fd) {
         return file_desc(fd);
     }
@@ -342,6 +344,10 @@ private:
 
 
 namespace posix {
+
+static constexpr unsigned rcv_shutdown = 0x1;
+static constexpr unsigned snd_shutdown = 0x2;
+static inline constexpr unsigned shutdown_mask(int how) { return how + 1; }
 
 /// Converts a duration value to a `timespec`
 ///

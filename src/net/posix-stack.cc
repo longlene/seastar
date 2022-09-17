@@ -200,6 +200,18 @@ get_posix_connected_socket_ops(sa_family_t family, int protocol) {
     }
 }
 
+static void shutdown_socket_fd(pollable_fd& fd, int how) noexcept {
+    try {
+        // file_desc::shutdown ignores ENOTCONN. Other reasons for exception
+        // EINVAL (wrong "how") -- impossible
+        // ENOTSOCK (not a socket) -- incredible
+        // EBADF (invalid file descriptor) -- irretrievable
+        fd.shutdown(how);
+    } catch (...) {
+        on_internal_error(seastar_logger, format("socket shutdown({}, {}) failed: {}", fd.get_file_desc().fdinfo(), how, std::current_exception()));
+    }
+}
+
 class posix_connected_socket_impl final : public connected_socket_impl {
     pollable_fd _fd;
     const posix_connected_socket_operations* _ops;
@@ -222,10 +234,10 @@ public:
         return data_sink(std::make_unique< posix_data_sink_impl>(_fd));
     }
     virtual void shutdown_input() override {
-        _fd.shutdown(SHUT_RD);
+        shutdown_socket_fd(_fd, SHUT_RD);
     }
     virtual void shutdown_output() override {
-        _fd.shutdown(SHUT_WR);
+        shutdown_socket_fd(_fd, SHUT_WR);
     }
     virtual void set_nodelay(bool nodelay) override {
         return _ops->set_nodelay(_fd.get_file_desc(), nodelay);
@@ -497,7 +509,7 @@ posix_server_socket_impl::accept() {
 
 void
 posix_server_socket_impl::abort_accept() {
-    _lfd.abort_reader();
+    _lfd.shutdown(SHUT_RD, pollable_fd::shutdown_kernel_only::no);
 }
 
 socket_address posix_server_socket_impl::local_address() const {
@@ -553,7 +565,7 @@ posix_reuseport_server_socket_impl::accept() {
 
 void
 posix_reuseport_server_socket_impl::abort_accept() {
-    _lfd.abort_reader();
+    _lfd.shutdown(SHUT_RD, pollable_fd::shutdown_kernel_only::no);
 }
 
 socket_address posix_reuseport_server_socket_impl::local_address() const {
@@ -762,10 +774,10 @@ public:
     virtual future<> send(const socket_address& dst, const char *msg) override;
     virtual future<> send(const socket_address& dst, packet p) override;
     virtual void shutdown_input() override {
-        _fd.abort_reader();
+        _fd.shutdown(SHUT_RD, pollable_fd::shutdown_kernel_only::no);
     }
     virtual void shutdown_output() override {
-        _fd.abort_writer();
+        _fd.shutdown(SHUT_WR, pollable_fd::shutdown_kernel_only::no);
     }
     virtual void close() override {
         _closed = true;

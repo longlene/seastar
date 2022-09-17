@@ -745,7 +745,7 @@ target_link_libraries (seastar
     Boost::boost
     Boost::program_options
     Boost::thread
-    c-ares::c-ares
+    c-ares::cares
     cryptopp::cryptopp
     fmt::fmt
     lz4::lz4
@@ -930,7 +930,7 @@ if (Seastar_HWLOC)
     PRIVATE hwloc::hwloc)
 endif ()
 
-set_option_if_package_is_found(Seastar_IO_URING LibUring)
+set_option_if_package_is_found (Seastar_IO_URING LibUring)
 if (Seastar_IO_URING)
   list (APPEND Seastar_PRIVATE_COMPILE_DEFINITIONS SEASTAR_HAVE_URING)
   target_link_libraries (seastar

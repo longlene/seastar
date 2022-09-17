@@ -8,6 +8,7 @@ import functools
 import glob
 import itertools
 import logging
+import math
 import multiprocessing
 import os
 import pathlib
@@ -247,17 +248,103 @@ def learn_all_irqs_one(irq_conf_dir, irq2procline, xen_dev_name):
 def get_irqs2procline_map():
     return { line.split(':')[0].lstrip().rstrip() : line for line in open('/proc/interrupts', 'r').readlines() }
 
+
+class AutodetectError(Exception):
+    pass
+
+
+def auto_detect_irq_mask(cpu_mask, cores_per_irq_core):
+    """
+    The logic of auto-detection of what was once a 'mode' is generic and is all about the amount of CPUs and NUMA
+    nodes that are present and a restricting 'cpu_mask'.
+    This function implements this logic:
+
+    * up to 4 CPU threads: use 'cpu_mask'
+    * up to 4 CPU cores (on x86 this would translate to 8 CPU threads): use a single CPU thread out of allowed
+    * up to 16 CPU cores: use a single CPU core out of allowed
+    * more than 16 CPU cores: use a single CPU core for each 16 CPU cores and distribute them evenly among all
+      present NUMA nodes.
+
+    An AutodetectError exception is raised if 'cpu_mask' is defined in a way that there is a different number of threads
+    and/or cores among different NUMA nodes. In such a case a user needs to provide
+    an IRQ CPUs definition explicitly using 'irq_cpu_mask' parameter.
+
+    :param cpu_mask: CPU mask that defines which out of present CPUs can be considered for tuning
+    :param cores_per_irq_core number of cores to allocate a single IRQ core out of, e.g. 6 means allocate a single IRQ
+                              core out of every 6 CPU cores.
+    :return: CPU mask to bind IRQs to, a.k.a. irq_cpu_mask
+    """
+    cores_key = 'cores'
+    PUs_key = 'PUs'
+
+    # List of NUMA IDs that own CPUs from the given CPU mask
+    numa_ids_list = run_hwloc_calc(['-I', 'numa', cpu_mask]).split(",")
+
+    # Let's calculate number of HTs and cores on each NUMA node belonging to the given CPU set
+    cores_PUs_per_numa = {} # { <numa_id> : {'cores':  <number of cores>, 'PUs': <number of PUs>}}
+    for n in numa_ids_list:
+        num_cores = int(run_hwloc_calc(['--restrict', cpu_mask, '--number-of', 'core', f'numa:{n}']))
+        num_PUs = int(run_hwloc_calc(['--restrict', cpu_mask, '--number-of', 'PU', f'numa:{n}']))
+        cores_PUs_per_numa[n] = {cores_key: num_cores, PUs_key: num_PUs}
+
+    # Let's check if configuration on each NUMA is the same. If it's not then we can't auto-detect the IRQs CPU set
+    # and a user needs to provide it explicitly
+    num_cores0 = cores_PUs_per_numa[numa_ids_list[0]][cores_key]
+    num_PUs0 = cores_PUs_per_numa[numa_ids_list[0]][PUs_key]
+    for n in numa_ids_list:
+        if cores_PUs_per_numa[n][cores_key] != num_cores0 or cores_PUs_per_numa[n][PUs_key] != num_PUs0:
+            raise AutodetectError(f"NUMA{n} has a different configuration from NUMA0 for a given CPU mask {cpu_mask}: "
+                                  f"{cores_PUs_per_numa[n][cores_key]}:{cores_PUs_per_numa[n][PUs_key]} vs "
+                                  f"{num_cores0}:{num_PUs0}. Auto-detection of IRQ CPUs in not possible. "
+                                  f"Please, provide irq_cpu_mask explicitly.")
+
+    # Auto-detection of IRQ CPU set is possible - let's get to it!
+    #
+    # Total counts for the whole machine
+    num_cores = int(run_hwloc_calc(['--restrict', cpu_mask, '--number-of', 'core', 'machine:0']))
+    num_PUs = int(run_hwloc_calc(['--restrict', cpu_mask, '--number-of', 'PU', 'machine:0']))
+
+    if num_PUs <= 4:
+        return cpu_mask
+    elif num_cores <= 4:
+        return run_hwloc_calc(['--restrict', cpu_mask, 'PU:0'])
+    elif num_cores <= cores_per_irq_core:
+        return run_hwloc_calc(['--restrict', cpu_mask, 'core:0'])
+    else:
+        # Big machine.
+        # Let's allocate a full core out of every cores_per_irq_core cores.
+        # Let's distribute IRQ cores among present NUMA nodes
+        num_irq_cores = math.ceil(num_cores / cores_per_irq_core)
+        hwloc_args = []
+        numa_cores_count = {n: 0 for n in numa_ids_list}
+        added_cores = 0
+        while added_cores < num_irq_cores:
+            for numa in numa_ids_list:
+                hwloc_args.append(f"node:{numa}.core:{numa_cores_count[numa]}")
+                added_cores += 1
+                numa_cores_count[numa] += 1
+
+                if added_cores >= num_irq_cores:
+                    break
+
+        return run_hwloc_calc(['--restrict', cpu_mask] + hwloc_args)
+
+
 ################################################################################
 class PerfTunerBase(metaclass=abc.ABCMeta):
     def __init__(self, args):
         self.__args = args
         self.__args.cpu_mask = run_hwloc_calc(['--restrict', self.__args.cpu_mask, 'all'])
         self.__mode = None
-        self.__irq_cpu_mask = args.irq_cpu_mask
-        if self.__irq_cpu_mask:
-            self.__compute_cpu_mask = run_hwloc_calc([self.__args.cpu_mask, "~{}".format(self.__irq_cpu_mask)])
+        self.__compute_cpu_mask = None
+
+        if self.args.mode:
+            self.mode = PerfTunerBase.SupportedModes[self.args.mode]
+        elif args.irq_cpu_mask:
+            self.irqs_cpu_mask = args.irq_cpu_mask
         else:
-            self.__compute_cpu_mask = None
+            self.irqs_cpu_mask = auto_detect_irq_mask(self.cpu_mask, self.cores_per_irq_core)
+
         self.__is_aws_i3_nonmetal_instance = None
 
 #### Public methods ##########################
@@ -300,13 +387,14 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
     @staticmethod
     def cpu_mask_is_zero(cpu_mask):
         """
-        The irqs_cpu_mask is a coma-separated list of 32-bit hex values, e.g. 0xffff,0x0,0xffff
+        The cpu_mask is a comma-separated list of 32-bit hex values with possibly omitted zero components,
+        e.g. 0xffff,,0xffff
         We want to estimate if the whole mask is all-zeros.
         :param cpu_mask: hwloc-calc generated CPU mask
         :return: True if mask is zero, False otherwise
         """
-        for cur_irqs_cpu_mask in cpu_mask.split(','):
-            if int(cur_irqs_cpu_mask, 16) != 0:
+        for cur_cpu_mask in cpu_mask.split(','):
+            if cur_cpu_mask and int(cur_cpu_mask, 16) != 0:
                 return False
 
         return True
@@ -314,27 +402,26 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
     @staticmethod
     def compute_cpu_mask_for_mode(mq_mode, cpu_mask):
         mq_mode = PerfTunerBase.SupportedModes(mq_mode)
-        irqs_cpu_mask = 0
 
         if mq_mode == PerfTunerBase.SupportedModes.sq:
             # all but CPU0
-            irqs_cpu_mask = run_hwloc_calc([cpu_mask, '~PU:0'])
+            compute_cpu_mask = run_hwloc_calc([cpu_mask, '~PU:0'])
         elif mq_mode == PerfTunerBase.SupportedModes.sq_split:
             # all but CPU0 and its HT siblings
-            irqs_cpu_mask = run_hwloc_calc([cpu_mask, '~core:0'])
+            compute_cpu_mask = run_hwloc_calc([cpu_mask, '~core:0'])
         elif mq_mode == PerfTunerBase.SupportedModes.mq:
             # all available cores
-            irqs_cpu_mask = cpu_mask
+            compute_cpu_mask = cpu_mask
         elif mq_mode == PerfTunerBase.SupportedModes.no_irq_restrictions:
             # all available cores
-            irqs_cpu_mask = cpu_mask
+            compute_cpu_mask = cpu_mask
         else:
             raise Exception("Unsupported mode: {}".format(mq_mode))
 
-        if PerfTunerBase.cpu_mask_is_zero(irqs_cpu_mask):
+        if PerfTunerBase.cpu_mask_is_zero(compute_cpu_mask):
             raise PerfTunerBase.CPUMaskIsZeroException("Bad configuration mode ({}) and cpu-mask value ({}): this results in a zero-mask for compute".format(mq_mode.name, cpu_mask))
 
-        return irqs_cpu_mask
+        return compute_cpu_mask
 
     @staticmethod
     def irqs_cpu_mask_for_mode(mq_mode, cpu_mask):
@@ -357,10 +444,6 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
         """
         Return the configuration mode
         """
-        # Make sure the configuration mode is set (see the __set_mode_and_masks() description).
-        if self.__mode is None:
-            self.__set_mode_and_masks()
-
         return self.__mode
 
     @mode.setter
@@ -382,14 +465,25 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
         return self.__args.cpu_mask
 
     @property
+    def cores_per_irq_core(self):
+        """
+        Return the number of cores we are going to allocate a single IRQ core out of when auto-detecting
+        """
+        return self.__args.cores_per_irq_core
+
+    @staticmethod
+    def min_cores_per_irq_core():
+        """
+        A minimum value of cores_per_irq_core.
+        We don't allocate a full IRQ core if total number of CPU cores is less or equal to 4.
+        """
+        return 5
+
+    @property
     def compute_cpu_mask(self):
         """
         Return the CPU mask to use for seastar application binding.
         """
-        # see the __set_mode_and_masks() description
-        if self.__compute_cpu_mask is None:
-            self.__set_mode_and_masks()
-
         return self.__compute_cpu_mask
 
     @property
@@ -397,11 +491,28 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
         """
         Return the mask of CPUs used for IRQs distribution.
         """
-        # see the __set_mode_and_masks() description
-        if self.__irq_cpu_mask is None:
-            self.__set_mode_and_masks()
-
         return self.__irq_cpu_mask
+
+    @irqs_cpu_mask.setter
+    def irqs_cpu_mask(self, new_irq_cpu_mask):
+        self.__irq_cpu_mask = new_irq_cpu_mask
+
+        # Sanity check
+        if PerfTunerBase.cpu_mask_is_zero(self.__irq_cpu_mask):
+            raise PerfTunerBase.CPUMaskIsZeroException("Bad configuration: zero IRQ CPU mask is given")
+
+        if run_hwloc_calc([self.__irq_cpu_mask]) == run_hwloc_calc([self.cpu_mask]):
+            # Special case: if IRQ CPU mask is the same as total CPU mask - set a Compute CPU mask to cpu_mask
+            self.__compute_cpu_mask = self.cpu_mask
+        else:
+            # Otherwise, a Compute CPU mask is a CPU mask without IRQ CPU mask bits
+            self.__compute_cpu_mask = run_hwloc_calc([self.cpu_mask, f"~{self.__irq_cpu_mask}"])
+
+        # Sanity check
+        if PerfTunerBase.cpu_mask_is_zero(self.__compute_cpu_mask):
+            raise PerfTunerBase.CPUMaskIsZeroException(
+                f"Bad configuration: cpu_maks:{self.cpu_mask}, irq_cpu_mask:{self.__irq_cpu_mask}: "
+                f"results in a zero-mask for compute")
 
     @property
     def is_aws_i3_non_metal_instance(self):
@@ -426,12 +537,6 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
     def tune(self):
         pass
 
-    @abc.abstractmethod
-    def _get_def_mode(self):
-        """
-        Return a default configuration mode.
-        """
-        pass
 
     @abc.abstractmethod
     def _get_irqs(self):
@@ -441,20 +546,6 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
         pass
 
 #### Private methods ############################
-    def __set_mode_and_masks(self):
-        """
-        Sets the configuration mode and the corresponding CPU masks. We can't
-        initialize them in the constructor because the default mode may depend
-        on the child-specific values that are set in its constructor.
-
-        That's why we postpone the mode's and the corresponding masks'
-        initialization till after the child instance creation.
-        """
-        if self.__args.mode:
-            self.mode = PerfTunerBase.SupportedModes[self.__args.mode]
-        else:
-            self.mode = self._get_def_mode()
-
     def __check_host_type(self):
         """
         Check if we are running on the AWS i3 nonmetal instance.
@@ -489,8 +580,8 @@ class NetPerfTuner(PerfTunerBase):
         # check that self.nics contain a HW device or a bonding interface
         self.__check_nics()
 
-        self.__irqs2procline = get_irqs2procline_map()
-        self.__nic2irqs = self.__learn_irqs()
+        # Fetch IRQs related info
+        self.__get_irqs_info()
 
 
 #### Public methods ############################
@@ -531,17 +622,6 @@ class NetPerfTuner(PerfTunerBase):
         return iter(self.__slaves[nic])
 
 #### Protected methods ##########################
-    def _get_def_mode(self):
-        num_cores = int(run_hwloc_calc(['--restrict', self.args.cpu_mask, '--number-of', 'core', 'machine:0']))
-        num_PUs = int(run_hwloc_calc(['--restrict', self.args.cpu_mask, '--number-of', 'PU', 'machine:0']))
-
-        if num_PUs <= 4:
-            return PerfTunerBase.SupportedModes.mq
-        elif num_cores <= 4:
-            return PerfTunerBase.SupportedModes.sq
-        else:
-            return PerfTunerBase.SupportedModes.sq_split
-
     def _get_irqs(self):
         """
         Returns the iterator for all IRQs that are going to be configured (according to args.nics parameter).
@@ -550,6 +630,10 @@ class NetPerfTuner(PerfTunerBase):
         return itertools.chain.from_iterable(self.__nic2irqs.values())
 
 #### Private methods ############################
+    def __get_irqs_info(self):
+        self.__irqs2procline = get_irqs2procline_map()
+        self.__nic2irqs = self.__learn_irqs()
+
     @property
     def __rfs_table_size(self):
         return 32768
@@ -609,7 +693,7 @@ class NetPerfTuner(PerfTunerBase):
         op = "Enable"
         value = 'on'
 
-        if (self.args.enable_arfs is None and self.mode != PerfTunerBase.SupportedModes.mq) or self.args.enable_arfs == False:
+        if (self.args.enable_arfs is None and self.irqs_cpu_mask == self.cpu_mask) or self.args.enable_arfs is False:
             op = "Disable"
             value = 'off'
 
@@ -673,14 +757,14 @@ class NetPerfTuner(PerfTunerBase):
         Intel's fast path IRQs have the following name convention:
              <bla-bla>-TxRx-<queue index>
 
-        Intel NICs also have the IRQ for Flow Director (which is not a regular fast path IRQ) which name looks like
+        Intel NICs also have the IRQ for Flow Director (which is not a regular fast path IRQ) whose name looks like
         this:
              <bla-bla>:fdir-TxRx-<index>
 
         We want to put the Flow Director's IRQ at the end of the sorted list of IRQs.
 
         :param irq: IRQ number
-        :return: HW queue index for Intel NICs and 0 for all other NICs
+        :return: HW queue index for Intel NICs and sys.maxsize for all other NICs
         """
         intel_fp_irq_re = re.compile("\-TxRx\-(\d+)")
         fdir_re = re.compile("fdir\-TxRx\-\d+")
@@ -705,7 +789,7 @@ class NetPerfTuner(PerfTunerBase):
              mlx4-<index>
 
         :param irq: IRQ number
-        :return: HW queue index for Mellanox NICs and 0 for all other NICs
+        :return: HW queue index for Mellanox NICs and sys.maxsize for all other NICs
         """
         mlx5_fp_irq_re = re.compile("mlx5_comp(\d+)")
         mlx4_fp_irq_re = re.compile("mlx4\-(\d+)")
@@ -719,6 +803,30 @@ class NetPerfTuner(PerfTunerBase):
                 return int(m4.group(1))
 
         return sys.maxsize
+
+    def __virtio_irq_to_queue_idx(self, irq):
+        """
+        Return the HW queue index for a given IRQ for VIRTIO in order to sort the IRQs' list by this index.
+
+        VIRTIO NICs have the IRQ's name that looks like this:
+        Queue K of a device virtioY, where Y is some integer is comprised of 2 IRQs
+        with following names:
+          * Tx IRQ:
+               virtioY-output.K
+          * Rx IRQ:
+               virtioY-input.K
+
+        :param irq: IRQ number
+        :return: HW queue index for VIRTIO fast path IRQ and sys.maxsize for all other IRQs
+        """
+        virtio_fp_re = re.compile(r"virtio\d+-(input|output)\.(\d+)$")
+
+        virtio_fp_irq = virtio_fp_re.search(self.__irqs2procline[irq])
+        if virtio_fp_irq:
+            return int(virtio_fp_irq.group(2))
+
+        return sys.maxsize
+
 
     def __get_driver_name(self, iface):
         """
@@ -754,6 +862,7 @@ class NetPerfTuner(PerfTunerBase):
                       mlx4-<queue idx>@<bla-bla>
                       or for mlx5
                       mlx5_comp<queue idx>@<bla-bla>
+          - VIRTIO: virtioN-[input|output].D
 
         So, we will try to filter the etries in /proc/interrupts for IRQs we've got from get_all_irqs_one()
         according to the patterns above.
@@ -768,17 +877,66 @@ class NetPerfTuner(PerfTunerBase):
         """
         # filter 'all_irqs' to only reference valid keys from 'irqs2procline' and avoid an IndexError on the 'irqs' search below
         all_irqs = set(learn_all_irqs_one("/sys/class/net/{}/device".format(iface), self.__irqs2procline, iface)).intersection(self.__irqs2procline.keys())
-        fp_irqs_re = re.compile("\-TxRx\-|\-fp\-|\-Tx\-Rx\-|mlx4-\d+@|mlx5_comp\d+@")
-        irqs = list(filter(lambda irq : fp_irqs_re.search(self.__irqs2procline[irq]), all_irqs))
+        fp_irqs_re = re.compile("\-TxRx\-|\-fp\-|\-Tx\-Rx\-|mlx4-\d+@|mlx5_comp\d+@|virtio\d+-(input|output)")
+        irqs = sorted(list(filter(lambda irq : fp_irqs_re.search(self.__irqs2procline[irq]), all_irqs)))
         if irqs:
-            driver_name = self.__get_driver_name(iface)
-            if (driver_name.startswith("mlx")):
-                irqs.sort(key=self.__mlx_irq_to_queue_idx)
-            else:
-                irqs.sort(key=self.__intel_irq_to_queue_idx)
+            irqs.sort(key=self.__get_irq_to_queue_idx_functor(iface))
             return irqs
         else:
             return list(all_irqs)
+
+    def __get_irq_to_queue_idx_functor(self, iface):
+        """
+        Get a functor returning a queue index for a given IRQ.
+        This functor is needed for NICs that are known to not release IRQs when the number of Rx
+        channels is reduced or have extra IRQs for non-RSS channels.
+
+        Therefore, for these NICs we need a functor that would allow us to pick IRQs that belong to channels that are
+        going to handle TCP traffic: first X channels, where the value of X depends on the NIC's type and configuration.
+
+        For others, e.g. ENA, or Broadcom, which are only going to allocate IRQs that belong to TCP handling channels,
+        we don't really need to sort them as long as we filter fast path IRQs and distribute them evenly among IRQ CPUs.
+
+        :param iface: NIC's interface name, e.g. eth19
+        :return: A functor that returns a queue index for a given IRQ if a mapping is known
+                 or a constant big integer value if mapping is unknown.
+        """
+        # There are a few known drivers for which we know how to get a queue index from an IRQ name in /proc/interrupts
+        driver_name = self.__get_driver_name(iface)
+
+        # Every functor returns a sys.maxsize for an unknown driver IRQs.
+        # So, choosing Intel's as a default is as good as any other.
+        irq_to_idx_func = self.__intel_irq_to_queue_idx
+        if driver_name.startswith("mlx"):
+            irq_to_idx_func = self.__mlx_irq_to_queue_idx
+        elif driver_name.startswith("virtio"):
+            irq_to_idx_func = self.__virtio_irq_to_queue_idx
+
+        return irq_to_idx_func
+
+    def __irq_lower_bound_by_queue(self, iface, irqs, queue_idx):
+        """
+        Get the index of the first element in irqs array which queue is greater or equal to a given index.
+        IRQs array is supposed to be sorted by queues numbers IRQs belong to.
+
+        There are additional assumptions:
+          * IRQs array items queue numbers are monotonically not decreasing, and if it increases then it increases by
+            one.
+          * Queue indexes are numbered starting from zero.
+
+        :param irqs: IRQs array sorted by queues numbers IRQs belong to
+        :param queue_idx: Queue index to partition by
+        :return: The first index in the IRQs array that corresponds to a queue number greater or equal to a given index
+                 which is at least queue_idx. If there is no such IRQ - returns len(irqs).
+        """
+        irq_to_idx_func = self.__get_irq_to_queue_idx_functor(iface)
+
+        if queue_idx < len(irqs):
+            for idx in range(queue_idx, len(irqs)):
+                if irq_to_idx_func(irqs[idx]) >= queue_idx:
+                    return idx
+
+        return len(irqs)
 
     def __learn_irqs(self):
         """
@@ -804,7 +962,60 @@ class NetPerfTuner(PerfTunerBase):
         """
         return glob.glob("/sys/class/net/{}/queues/*/rps_cpus".format(iface))
 
+    def __set_rx_channels_count(self, iface, count):
+        """
+        Try to set the number of Rx channels of a given interface to a given value.
+
+        Rx channels of any NIC can be configured using 'ethtool -L' command using one of the following semantics:
+
+        ethtool -L <iface> rx <count>
+        or
+        ethtool -L <iface> combined <count>
+
+        If a specific semantics is not supported by a given NIC or if changing the number of channels is not supported
+        ethtool is going to return an error.
+
+        Instead of parsing and trying to detect which one of the following semantics a given interface supports we will
+        simply try to use both semantics till either one of them succeeds or both fail.
+
+
+        :param iface: NIC interface name, e.g. eth4
+        :param count: number of Rx channels we want to configure
+        :return: True if configuration was successful, False otherwise
+        """
+        options = ["rx", "combined"]
+        for o in options:
+            try:
+                cmd = ['ethtool', '-L', iface, o, f"{count}"]
+                perftune_print(f"Executing: {' '.join(cmd)}")
+                run_one_command(cmd, stderr=subprocess.DEVNULL)
+                return True
+            except subprocess.CalledProcessError:
+                pass
+
+        return False
+
     def __setup_one_hw_iface(self, iface):
+        # Set Rx channels count to a number of IRQ CPUs unless an explicit count is given
+        if self.args.num_rx_queues is not None:
+            num_rx_channels = self.args.num_rx_queues
+        else:
+            num_rx_channels = 0
+
+            # If a mask is wider than 32 bits it's going to be presented as a comma-separated list of 32-bit masks
+            # with possibly omitted zero components, e.g. 0x01,0x100,,0x12122
+            for m in self.irqs_cpu_mask.split(","):
+                if m:
+                    num_rx_channels += bin(int(m, 16)).count('1')
+
+        # Let's try setting the number of Rx channels to the number of IRQ CPUs.
+        #
+        # If we were able to change the number of Rx channels the number of IRQs could have changed.
+        # In this case let's refresh IRQs info.
+        rx_channels_set = self.__set_rx_channels_count(iface, num_rx_channels)
+        if rx_channels_set:
+            self.__get_irqs_info()
+
         max_num_rx_queues = self.__max_rx_queue_count(iface)
         all_irqs = self.__get_irqs_one(iface)
 
@@ -812,12 +1023,13 @@ class NetPerfTuner(PerfTunerBase):
         #
         # If this NIC has a limited number of Rx queues then we want to distribute their IRQs separately.
         # For such NICs we've sorted IRQs list so that IRQs that handle Rx are all at the head of the list.
-        if max_num_rx_queues < len(all_irqs):
+        if rx_channels_set or max_num_rx_queues < len(all_irqs):
             num_rx_queues = self.__get_rx_queue_count(iface)
-            perftune_print("Distributing IRQs handling Rx:")
-            distribute_irqs(all_irqs[0:num_rx_queues], self.irqs_cpu_mask)
+            tcp_irqs_lower_bound = self.__irq_lower_bound_by_queue(iface, all_irqs, num_rx_queues)
+            perftune_print(f"Distributing IRQs handling Rx and Tx for first {num_rx_queues} channels:")
+            distribute_irqs(all_irqs[0:tcp_irqs_lower_bound], self.irqs_cpu_mask)
             perftune_print("Distributing the rest of IRQs")
-            distribute_irqs(all_irqs[num_rx_queues:], self.irqs_cpu_mask)
+            distribute_irqs(all_irqs[tcp_irqs_lower_bound:], self.irqs_cpu_mask)
         else:
             perftune_print("Distributing all IRQs")
             distribute_irqs(all_irqs, self.irqs_cpu_mask)
@@ -916,19 +1128,13 @@ class SystemPerfTuner(PerfTunerBase):
     def tune(self):
         if self.args.tune_clock:
             if not self._clocksource_manager.setting_available():
-                perftune_print("Clocksource setting not available or not needed for this architecture. Not tuning");
+                perftune_print("Clocksource setting not available or not needed for this architecture. Not tuning")
             elif not self._clocksource_manager.preferred_clocksource_available():
                 perftune_print(self._clocksource_manager.recommendation_if_unavailable())
             else:
                 self._clocksource_manager.enforce_preferred_clocksource()
 
 #### Protected methods ##########################
-    def _get_def_mode(self):
-        """ 
-        This tuner doesn't apply any restriction to the final tune mode for now.
-        """
-        return PerfTunerBase.SupportedModes.no_irq_restrictions
-
     def _get_irqs(self):
         return []
 
@@ -964,12 +1170,10 @@ class DiskPerfTuner(PerfTunerBase):
            - Distribute non-NVMe disks' IRQs equally among designated CPUs or among
              all available CPUs in the 'mq' mode.
         """
-        mode_cpu_mask = PerfTunerBase.irqs_cpu_mask_for_mode(self.mode, self.args.cpu_mask)
-
         non_nvme_disks, non_nvme_irqs = self.__disks_info_by_type(DiskPerfTuner.SupportedDiskTypes.non_nvme)
         if non_nvme_disks:
             perftune_print("Setting non-NVMe disks: {}...".format(", ".join(non_nvme_disks)))
-            distribute_irqs(non_nvme_irqs, mode_cpu_mask)
+            distribute_irqs(non_nvme_irqs, self.irqs_cpu_mask)
             self.__tune_disks(non_nvme_disks)
         else:
             perftune_print("No non-NVMe disks to tune")
@@ -995,24 +1199,6 @@ class DiskPerfTuner(PerfTunerBase):
             perftune_print("No NVMe disks to tune")
 
 #### Protected methods ##########################
-    def _get_def_mode(self):
-        """
-        Return a default configuration mode.
-        """
-        # if the only disks we are tuning are NVMe disks - return the MQ mode
-        non_nvme_disks, non_nvme_irqs = self.__disks_info_by_type(DiskPerfTuner.SupportedDiskTypes.non_nvme)
-        if not non_nvme_disks:
-            return PerfTunerBase.SupportedModes.mq
-
-        num_cores = int(run_hwloc_calc(['--restrict', self.args.cpu_mask, '--number-of', 'core', 'machine:0']))
-        num_PUs = int(run_hwloc_calc(['--restrict', self.args.cpu_mask, '--number-of', 'PU', 'machine:0']))
-        if num_PUs <= 4:
-            return PerfTunerBase.SupportedModes.mq
-        elif num_cores <= 4:
-            return PerfTunerBase.SupportedModes.sq
-        else:
-            return PerfTunerBase.SupportedModes.sq_split
-
     def _get_irqs(self):
         return itertools.chain.from_iterable(irqs for disks, irqs in self.__type2diskinfo.values())
 
@@ -1061,7 +1247,7 @@ class DiskPerfTuner(PerfTunerBase):
         nvme_irq_re = re.compile(r'(\s|^)nvme\d+q(\d+)(\s|$)')
 
         # There may be more than an single HW queue bound to the same IRQ. In this case queue names are going to be
-        # coma separated
+        # comma separated
         split_line = self.__irqs2procline[irq].split(",")
 
         for line in split_line:
@@ -1322,7 +1508,8 @@ This script will:
 
     - Ban relevant IRQs from being moved by irqbalance.
     - Configure various system parameters in /proc/sys.
-    - Distribute the IRQs (using SMP affinity configuration) among CPUs according to the configuration mode (see below).
+    - Distribute the IRQs (using SMP affinity configuration) among CPUs according to the configuration mode (see below)
+      or an 'irq_cpu_mask' value.
 
 As a result some of the CPUs may be destined to only handle the IRQs and taken out of the CPU set
 that should be used to run the seastar application ("compute CPU set").
@@ -1340,8 +1527,10 @@ Modes description:
       spreads NAPIs' handling between all CPUs.
 
  If there isn't any mode given script will use a default mode:
-    - If number of physical CPU cores per Rx HW queue is greater than 4 - use the 'sq-split' mode.
-    - Otherwise, if number of hyperthreads per Rx HW queue is greater than 4 - use the 'sq' mode.
+    - If number of CPU cores is greater than 16, allocate a single IRQ CPU core for each 16 CPU cores in 'cpu_mask'.
+      IRQ cores are going to be allocated evenly on available NUMA nodes according to 'cpu_mask' value.  
+    - If number of physical CPU cores per Rx HW queue is greater than 4 and less than 16 - use the 'sq-split' mode.
+    - Otherwise, if number of hyper-threads per Rx HW queue is greater than 4 - use the 'sq' mode.
     - Otherwise use the 'mq' mode.
 
 Default values:
@@ -1350,11 +1539,12 @@ Default values:
  --cpu-mask MASK - default: all available cores mask
  --tune-clock    - default: false
 ''')
-argp.add_argument('--mode', choices=PerfTunerBase.SupportedModes.names(), help='configuration mode')
+argp.add_argument('--mode', choices=PerfTunerBase.SupportedModes.names(), help='configuration mode (deprecated, use --irq-cpu-mask instead)')
 argp.add_argument('--nic', action='append', help='network interface name(s), by default uses \'eth0\' (may appear more than once)', dest='nics', default=[])
 argp.add_argument('--tune-clock', action='store_true', help='Force tuning of the system clocksource')
 argp.add_argument('--get-cpu-mask', action='store_true', help="print the CPU mask to be used for compute")
 argp.add_argument('--get-cpu-mask-quiet', action='store_true', help="print the CPU mask to be used for compute, print the zero CPU set if that's what it turns out to be")
+argp.add_argument('--get-irq-cpu-mask', action='store_true', help="print the CPU mask to be used for IRQs binding")
 argp.add_argument('--verbose', action='store_true', help="be more verbose about operations and their result")
 argp.add_argument('--tune', choices=TuneModes.names(), help="components to configure (may be given more than once)", action='append', default=[])
 argp.add_argument('--cpu-mask', help="mask of cores to use, by default use all available cores", metavar='MASK')
@@ -1366,6 +1556,13 @@ argp.add_argument('--dump-options-file', action='store_true', help="Print the co
 argp.add_argument('--dry-run', action='store_true', help="Don't take any action, just recommend what to do.")
 argp.add_argument('--write-back-cache', help="Enable/Disable \'write back\' write cache mode.", dest="set_write_back")
 argp.add_argument('--arfs', help="Enable/Disable aRFS", dest="enable_arfs")
+argp.add_argument('--num-rx-queues', help="Set a given number of Rx queues", type=int)
+argp.add_argument('--irq-core-auto-detection-ratio', help="Use a given ratio for IRQ mask auto-detection. For "
+                                                          "instance, if 8 is given and auto-detection is requested, a "
+                                                          "single IRQ CPU core is going to be allocated for every 8 "
+                                                          "CPU cores out of available according to a 'cpu_mask' value."
+                                                          "Default is 16",
+                  type=int, default=16, dest='cores_per_irq_core')
 
 def parse_cpu_mask_from_yaml(y, field_name, fname):
     hex_32bit_pattern='0x[0-9a-fA-F]{1,8}'
@@ -1443,11 +1640,20 @@ def parse_options_file(prog_args):
     if 'arfs' in y:
         prog_args.enable_arfs = distutils.util.strtobool("{}".format(y['arfs']))
 
+    if 'num_rx_queues' in y:
+        prog_args.num_rx_queues = int(y['num_rx_queues'])
+
+    # prog_options['irq_core_auto_detection_ratio'] = prog_args.cores_per_irq_core
+    if 'irq_core_auto_detection_ratio' in y:
+        prog_args.cores_per_irq_core = int(y['irq_core_auto_detection_ratio'])
+
 def dump_config(prog_args):
     prog_options = {}
 
     if prog_args.mode:
-        prog_options['mode'] = prog_args.mode
+        assert prog_args.cpu_mask, "cpu_mask has to always be set. Something is terribly wrong (a bug in perftune.py?)"
+        mode = PerfTunerBase.SupportedModes[prog_args.mode]
+        prog_options['irq_cpu_mask'] = PerfTunerBase.irqs_cpu_mask_for_mode(mode, prog_args.cpu_mask)
 
     if prog_args.nics:
         prog_options['nic'] = list(set(prog_args.nics))
@@ -1476,6 +1682,11 @@ def dump_config(prog_args):
     if prog_args.enable_arfs is not None:
         prog_options['arfs'] = prog_args.enable_arfs
 
+    if prog_args.num_rx_queues is not None:
+        prog_options['num_rx_queues'] = f"{prog_args.num_rx_queues}"
+
+    prog_options['irq_core_auto_detection_ratio'] = prog_args.cores_per_irq_core
+
     perftune_print(yaml.dump(prog_options, default_flow_style=False))
 ################################################################################
 
@@ -1495,6 +1706,11 @@ if not args.tune:
 # The must be either 'mode' or an explicit 'irq_cpu_mask' given - not both
 if args.mode and args.irq_cpu_mask:
     sys.exit("ERROR: Provide either tune mode or IRQs CPU mask - not both.")
+
+# Sanity check
+if args.cores_per_irq_core < PerfTunerBase.min_cores_per_irq_core():
+    sys.exit(f"ERROR: irq_core_auto_detection_ratio value must be greater or equal than "
+             f"{PerfTunerBase.min_cores_per_irq_core()}")
 
 # set default values #####################
 if not args.nics:
@@ -1524,15 +1740,11 @@ try:
     if TuneModes.system.name in args.tune:
         tuners.append(SystemPerfTuner(args))
 
-    # Set the minimum mode among all tuners
-    if not args.irq_cpu_mask:
-        mode = PerfTunerBase.SupportedModes.combine([tuner.mode for tuner in tuners])
-        for tuner in tuners:
-            tuner.mode = mode
-
     if args.get_cpu_mask or args.get_cpu_mask_quiet:
         # Print the compute mask from the first tuner - it's going to be the same in all of them
         perftune_print(tuners[0].compute_cpu_mask)
+    elif args.get_irq_cpu_mask:
+        perftune_print(tuners[0].irqs_cpu_mask)
     else:
         # Tune the system
         restart_irqbalance(itertools.chain.from_iterable([ tuner.irqs for tuner in tuners ]))
